@@ -7,9 +7,11 @@ import (
 	"distributedCache/lru"
 	"distributedCache/monitor"
 	"distributedCache/myHttp"
+	"distributedCache/sentinel"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -32,12 +34,17 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(result))
 		return
 	}
-	if strings.Split(r.URL.String(), "/")[1] == "range" { //ip:port/range
+	reqType := strings.Split(r.URL.String(), "/")[1]
+	if reqType == "range" { //ip:port/range
 		res := inter.CacheRange()
 		w.Write([]byte(res))
 		return
 	}
-	if strings.Split(r.URL.String(), "/")[1] == "meet" { //ip:port/meet
+	/*
+		根据发送过来的请求报文将发送方的状态记录到本地的clusterNodes当中
+		ps：req报文体中只会有发送方的ip，port，监管槽位
+	*/
+	if reqType == "meet" { //ip:port/meet
 		bytes, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			w.Write([]byte(err.Error()))
@@ -62,7 +69,7 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			conf.YamlConfig.ClusterEnd)))
 		return
 	}
-	if strings.Split(r.URL.String(), "/")[1] == "redirect" { //ip:port/redirect
+	if reqType == "redirect" { //ip:port/redirect
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "server busy", http.StatusInternalServerError)
@@ -91,7 +98,7 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if strings.Split(r.URL.String(), "/")[1] == "status" { //读取当前节点信息
+	if reqType == "status" { //读取当前节点信息
 		bytes, err := json.Marshal(cluster.MyClusterNode)
 		if err != nil {
 			w.Write([]byte(err.Error()))
@@ -101,16 +108,91 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write(bytes)
 		return
 	}
+	if reqType == "logoff" {
+		defer r.Body.Close()
+		status := new(sentinel.ReAssignStatus)
+		var bytes []byte
+		r.Body.Read(bytes)
+		json.Unmarshal(bytes, status)
+		tmpSlots := status.Status[fmt.Sprintf("%s:%d", cluster.MyClusterNode.Ip, cluster.MyClusterNode.Port)]
+		for _, slot := range tmpSlots { //将临时负责的节点置一
+			cluster.MyClusterNode.Slots[slot] = 1
+		}
+		ip, port := cluster.MyClusterNode.WhoHasThisSlot(uint32(tmpSlots[0])) //将之前监管此槽位的节点（即下线节点）拿出
+
+		logoffNode := fmt.Sprintf("%s:%d", ip, port)
+		delete(cluster.MyClusterNode.ClusterNodes, logoffNode)                                            //删除该节点
+		delete(status.Status, fmt.Sprintf("%s:%d", cluster.MyClusterNode.Ip, cluster.MyClusterNode.Port)) //从分配任务中删除本节点
+		for nd, slots := range status.Status {                                                            //遍历删除本地节点后的分配任务来更新本地记录的其他状态
+			otherNode := cluster.MyClusterNode.ClusterNodes[nd]
+			for _, slot := range slots {
+				otherNode.Slots[slot] = 1
+			}
+			cluster.MyClusterNode.ClusterNodes[nd] = otherNode
+		}
+		w.Write([]byte("ok"))
+	}
+	if reqType == "recover" {
+		sentinel.LogoffMu.Lock() //同步读出本节点状态是否为正在进行下线处理
+		isHandling := sentinel.LogoffNodes[r.RemoteAddr]
+		sentinel.LogoffMu.Unlock()
+		for {
+			if isHandling { //如果正在处理本节点那就等到
+				continue
+			} else { //处理结束再进行后续操作
+				break
+			}
+		}
+		oldSlots := sentinel.LogOffCache[r.RemoteAddr]
+		tmp := sentinel.MySentinel.Slots
+		for _, slot := range oldSlots { //将重上线节点的槽位还给他
+			tmp[slot] = r.RemoteAddr
+		}
+		bytes, err := json.Marshal(tmp)
+		if err != nil {
+			w.Write([]byte(fmt.Sprintf("Marshal LogNodeCache failed:%s", err.Error())))
+			return
+		}
+		w.Write(bytes)
+		return
+	}
+	if reqType == "hb" { //普通节点响应心跳检测
+		w.Write([]byte("alive"))
+		return
+	}
 	http.Error(w, "nothing is here", 404)
 }
 
 func main() {
 	conf.SetConfig()
-	lru.Constructor(500)
-	cluster.ClusterNodeInit()
-	go monitor.Sysmon()
-	if err := myHttp.SetPeerStatus(); err != nil {
-		panic("MeetPeers failed")
+	resp, err := http.Get(fmt.Sprintf("http://%s:%d/recover", conf.YamlConfig.MainNodeIP, conf.YamlConfig.MainNodePort))
+	if err != nil {
+		log.Fatalln("get logOff from sentinel failed")
+	}
+	bytes, err := sentinel.RespReader(resp) //bytes是返回的本节点下线前监控的槽位
+	if err != nil {
+		log.Fatalln("read resp failed")
+	}
+	slots := make([]int, 0)
+	if strings.Contains(string(bytes), "[") {
+		err := json.Unmarshal(bytes, slots)
+		if err != nil {
+			log.Fatalln("Unmarshal Sentinel's Resp, oldSlots failed")
+		}
+	} else {
+		log.Fatalln("sentinel has some problems")
+	}
+	if conf.YamlConfig.Identity == "clusterNode" {
+		lru.Constructor(500)
+		cluster.ClusterNodeInit(slots)
+		go monitor.Sysmon()
+		if err := myHttp.SetPeerStatus(); err != nil {
+			panic("MeetPeers failed")
+		}
+	} else {
+		if err := sentinel.SentinelInit(); err != nil {
+			panic("failed to init sentinel")
+		}
 	}
 	var h htp = 10
 	http.ListenAndServe("0.0.0.0:80", &h)

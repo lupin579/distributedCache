@@ -101,7 +101,7 @@ func (this *LRUCache) Put(key string, value string, expire int64) *model.Node {
 			Value:     value,
 			Prev:      nil,
 			Next:      nil,
-			ExpiresAt: time.Now().Add(30 * time.Second).Unix(), //当前时间+有效时间
+			ExpiresAt: time.Now().Add(time.Duration(expire) * time.Second).Unix(), //当前时间+有效时间
 		}
 		this.len++
 		if head.Next == nil { //表中没有节点时添加节点

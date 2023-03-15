@@ -42,13 +42,19 @@ type ClusterNode struct {
 /*
 初始化节点和黑名单
 */
-func ClusterNodeInit() {
+func ClusterNodeInit(slots []int) {
 	MyBlackList = BlackList{
 		List:     make(map[string]int64),
 		EditTime: 0,
 	}
-	for i := conf.YamlConfig.ClusterStart; i <= conf.YamlConfig.ClusterEnd; i++ {
-		MyClusterNode.Slots[i] = 1
+	if len(slots) == 0 {
+		for i := conf.YamlConfig.ClusterStart; i <= conf.YamlConfig.ClusterEnd; i++ {
+			MyClusterNode.Slots[i] = 1
+		}
+	} else {
+		for i := range slots {
+			MyClusterNode.Slots[i] = 1
+		}
 	}
 	MyClusterNode.Ip = conf.YamlConfig.IP
 	MyClusterNode.Port = conf.YamlConfig.Port

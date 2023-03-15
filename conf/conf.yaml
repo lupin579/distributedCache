@@ -3,3 +3,9 @@ port: 80
 clusterStart: 0
 clusterEnd: 13
 peers: []
+
+identity: "sentinel"
+mainNodeIP: ""
+mainNodePort: 0
+
+sentinelAddr: []

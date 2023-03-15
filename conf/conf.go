@@ -14,6 +14,10 @@ type Config struct {
 	ClusterStart int      `yaml:"clusterStart"`
 	ClusterEnd   int      `yaml:"clusterEnd"`
 	Peers        []string `yaml:"peers"`
+	Identity     string   `yaml:"identity"`
+	MainNodeIP   string   `yaml:"mainNodeIP"`
+	MainNodePort int      `yaml:"mainNodePort"`
+	Sentinels    []string `yaml:"sentinels"`
 }
 
 func SetConfig() {
