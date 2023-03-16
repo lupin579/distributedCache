@@ -22,8 +22,7 @@ type htp int
 
 func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.String() == "/" { //ip:port/ 用于查询kv，格式：key:keyName
-		bytes, err := ioutil.ReadAll(r.Body)
-		defer r.Body.Close()
+		bytes, err := ReqReader(r)
 		if err != nil {
 			http.Error(w, "server busy", http.StatusInternalServerError)
 			return
@@ -109,10 +108,12 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if reqType == "logoff" {
-		defer r.Body.Close()
+		bytes, err := ReqReader(r)
+		if err != nil {
+			w.Write([]byte(err.Error()))
+			return
+		}
 		status := new(sentinel.ReAssignStatus)
-		var bytes []byte
-		r.Body.Read(bytes)
 		json.Unmarshal(bytes, status)
 		tmpSlots := status.Status[fmt.Sprintf("%s:%d", cluster.MyClusterNode.Ip, cluster.MyClusterNode.Port)]
 		for _, slot := range tmpSlots { //将临时负责的节点置一
@@ -121,7 +122,10 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ip, port := cluster.MyClusterNode.WhoHasThisSlot(uint32(tmpSlots[0])) //将之前监管此槽位的节点（即下线节点）拿出
 
 		logoffNode := fmt.Sprintf("%s:%d", ip, port)
-		delete(cluster.MyClusterNode.ClusterNodes, logoffNode)                                            //删除该节点
+		tmp := cluster.MyClusterNode.ClusterNodes[logoffNode] //将本节点看来的下线节点的监控槽位置0
+		tmp.Slots = [64]uint8{}
+		cluster.MyClusterNode.ClusterNodes[logoffNode] = tmp
+
 		delete(status.Status, fmt.Sprintf("%s:%d", cluster.MyClusterNode.Ip, cluster.MyClusterNode.Port)) //从分配任务中删除本节点
 		for nd, slots := range status.Status {                                                            //遍历删除本地节点后的分配任务来更新本地记录的其他状态
 			otherNode := cluster.MyClusterNode.ClusterNodes[nd]
@@ -132,35 +136,58 @@ func (h *htp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Write([]byte("ok"))
 	}
-	if reqType == "recover" {
-		sentinel.LogoffMu.Lock() //同步读出本节点状态是否为正在进行下线处理
-		isHandling := sentinel.LogoffNodes[r.RemoteAddr]
-		sentinel.LogoffMu.Unlock()
-		for {
-			if isHandling { //如果正在处理本节点那就等到
-				continue
-			} else { //处理结束再进行后续操作
-				break
-			}
-		}
-		oldSlots := sentinel.LogOffCache[r.RemoteAddr]
-		tmp := sentinel.MySentinel.Slots
-		for _, slot := range oldSlots { //将重上线节点的槽位还给他
-			tmp[slot] = r.RemoteAddr
-		}
-		bytes, err := json.Marshal(tmp)
+
+	if reqType == "reOnlineNotice" {
+		bytes, err := ReqReader(r)
 		if err != nil {
-			w.Write([]byte(fmt.Sprintf("Marshal LogNodeCache failed:%s", err.Error())))
+			w.Write([]byte(err.Error()))
 			return
 		}
-		w.Write(bytes)
-		return
+		slots := make(map[string][]int)
+		json.Unmarshal(bytes, slots)
+		for nd, NdSlots := range slots {
+			for _, slot := range NdSlots {
+				if cluster.MyClusterNode.Slots[slot] == 1 { //清除本节点对于重新上线节点槽位的监控
+					cluster.MyClusterNode.Slots[slot] = 0
+				}
+
+				tmp := cluster.MyClusterNode.ClusterNodes[nd] //恢复本节点看来重新上线节点对属于他的槽位的监控
+				tmp.Slots[slot] = 1
+				cluster.MyClusterNode.ClusterNodes[nd] = tmp
+
+				for nodeName, node := range cluster.MyClusterNode.ClusterNodes { //清除本节点看来的其他节点对于重新上线节点槽位的监控
+					if nodeName != nd {
+						for ndId, is := range node.Slots {
+							if is == 1 {
+								node.Slots[ndId] = 0
+							}
+						}
+					}
+				}
+			}
+
+		}
+
 	}
+
+	if reqType == "recover" {
+		sentinel.Recover(w, r)
+	}
+
 	if reqType == "hb" { //普通节点响应心跳检测
 		w.Write([]byte("alive"))
 		return
 	}
 	http.Error(w, "nothing is here", 404)
+}
+
+func ReqReader(r *http.Request) ([]byte, error) {
+	defer r.Body.Close()
+	bytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	return bytes, nil
 }
 
 func main() {
@@ -182,6 +209,7 @@ func main() {
 	} else {
 		log.Fatalln("sentinel has some problems")
 	}
+
 	if conf.YamlConfig.Identity == "clusterNode" {
 		lru.Constructor(500)
 		cluster.ClusterNodeInit(slots)

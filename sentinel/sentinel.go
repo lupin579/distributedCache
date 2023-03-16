@@ -134,12 +134,13 @@ func LogOffHandler(node string) {
 		reAssignStatus[runningNodesArray[i]] = reassignSlots[i*perReassignSlotsNum : (i+1)*perReassignSlotsNum]
 	}
 	reAssignStatus[runningNodesArray[runningNodesNum-1]] = reassignSlots[runningNodesNum-1:]
+
 	sendBody := ReAssignStatus{Status: reAssignStatus}
 	body, err := json.Marshal(sendBody)
 	if err != nil {
 		log.Fatalf("LogOffHandler MarshalError :%s", err.Error())
 	}
-	for _, addr := range runningNodesArray {
+	for _, addr := range runningNodesArray { //向在运行的节点发送下线节点通知
 		ip := strings.Split(addr, ":")[0]
 		port, err := strconv.Atoi(strings.Split(addr, ":")[1])
 		if err != nil {
@@ -149,10 +150,10 @@ func LogOffHandler(node string) {
 		start := time.Now().Unix()
 		for {
 			resp, err = http.Post(fmt.Sprintf("http://%s:%d/reAssign", ip, port), "", strings.NewReader(string(body)))
-			if err == nil {
+			if err == nil { //发送成功则退出循环。发送失败重发
 				break
 			}
-			if time.Now().Unix()-start > 3 {
+			if time.Now().Unix()-start > 3 { //重发时间超过三秒则报错返回
 				log.Fatalf("reSend reAssign failed, please check your net or your running clusterNode:%s", err.Error())
 			}
 		}
@@ -166,6 +167,14 @@ func LogOffHandler(node string) {
 			log.Fatalf("please check %s:%d's status: %s", ip, port, "err : target node's resp is not \"ok\" !")
 		}
 	}
+
+	MySentinel.mu.Lock()
+	for nd, status := range reAssignStatus { //发送成功后修改哨兵的各节点槽位监管情况
+		for _, slot := range status {
+			MySentinel.Slots[slot] = nd
+		}
+	}
+	MySentinel.mu.Unlock()
 
 	LogoffMu.Lock() //同步地修改本节点状态为已下线处理结束
 	LogoffNodes[node] = false
@@ -206,6 +215,61 @@ func (sentinel *Sentinel) SetSentinelContent(status cluster.ClusterNode) {
 	}
 }
 
-func Recover() {
+func Recover(w http.ResponseWriter, r *http.Request) {
+	for {
+		LogoffMu.Lock() //同步读出本节点状态是否为正在进行下线处理
+		isHandling := LogoffNodes[r.RemoteAddr]
+		LogoffMu.Unlock()
+		if isHandling { //如果正在处理本节点那就等到
+			continue
+		} else { //处理结束再进行后续操作
+			break
+		}
+	}
+	MySentinel.nodeRetTime[r.RemoteAddr] = time.Now().Unix() //刷新上次响应时间防止再次被下线
+	oldSlots := LogOffCache[r.RemoteAddr]
+	tmp := MySentinel.Slots
+	for _, slot := range oldSlots { //将重新上线节点的槽位还给他
+		tmp[slot] = r.RemoteAddr
+	}
+	bytes, err := json.Marshal(tmp)
+	if err != nil {
+		w.Write([]byte(fmt.Sprintf("Marshal LogNodeCache failed:%s", err.Error())))
+		return
+	}
+	reOnlineNotice(r.RemoteAddr)
+	MySentinel.Slots = tmp //成功归还则将本地哨兵节点的slots情况改回重上线节点存在时的样子
+	w.Write(bytes)
+	return
+}
+
+func reOnlineNotice(nd string) {
+	tmp := make(map[string][]int)
+	tmp[nd] = LogOffCache[nd]
+	bytes, err := json.Marshal(tmp)
+	if err != nil {
+		log.Fatalf("reOnlineNotice Failed to unmarshal :%s", err.Error())
+	}
+	for nd, _ := range MySentinel.nodeRetTime {
+		now := time.Now().Unix()
+		for {
+			resp, err := http.Post(fmt.Sprintf("http://%s/reOnlineNotice", nd), "", strings.NewReader(string(bytes)))
+			if err != nil {
+				continue
+			} else {
+				bytesResp, err := RespReader(resp)
+				if err != nil {
+					log.Fatalf("reOnlineNotice Failed to read resp:%s", err)
+				}
+				if string(bytesResp) != "ok" {
+					log.Fatalln("target node's resp is not \"ok\"")
+				}
+				break
+			}
+			if time.Now().Unix()-now >= 3 {
+				log.Fatalf("timeout to reSend reOnlineNotice to %s", nd)
+			}
+		}
+	}
 
 }
